@@ -27,7 +27,12 @@ from unittest import mock
 
 from evdev.ecodes import EV_REL, EV_KEY, REL_Y, REL_X, REL_WHEEL, REL_HWHEEL
 
-from keymapper.injection.macros.macro import Macro, _type_check, macro_variables
+from keymapper.injection.macros.macro import (
+    Macro,
+    _type_check,
+    macro_variables,
+    _type_check_variablename,
+)
 from keymapper.injection.macros.parse import (
     parse,
     _extract_args,
@@ -35,6 +40,7 @@ from keymapper.injection.macros.parse import (
     _parse_recurse,
     handle_plus_syntax,
     _count_brackets,
+    _split_keyword_arg,
 )
 from keymapper.injection.context import Context
 from keymapper.config import config
@@ -45,7 +51,7 @@ from keymapper.utils import PRESS, RELEASE
 from tests.test import quick_cleanup, new_event
 
 
-class TestMacros(unittest.IsolatedAsyncioTestCase):
+class MacroTestBase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.result = []
 
@@ -69,6 +75,8 @@ class TestMacros(unittest.IsolatedAsyncioTestCase):
         print(f"\033[90mmacro wrote{(ev_type, code, value)}\033[0m")
         self.result.append((ev_type, code, value))
 
+
+class TestMacros(MacroTestBase):
     async def test_named_parameter(self):
         result = []
 
@@ -107,6 +115,38 @@ class TestMacros(unittest.IsolatedAsyncioTestCase):
         self.assertRaises(TypeError, lambda: _type_check("a", [Macro], "foo", 0))
         self.assertRaises(TypeError, lambda: _type_check(1, [Macro], "foo", 0))
         self.assertEqual(_type_check("1", [Macro, int], "foo", 4), 1)
+
+    def test_type_check_variablename(self):
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("1a"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("$a"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("a()"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("1"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("+"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("-"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("*"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("a,b"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("a,b"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename("#"))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename(1))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename(None))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename([]))
+        self.assertRaises(SyntaxError, lambda: _type_check_variablename(()))
+
+        # doesn't raise
+        _type_check_variablename("a")
+        _type_check_variablename("_a")
+        _type_check_variablename("_A")
+        _type_check_variablename("A")
+        _type_check_variablename("Abcd")
+        _type_check_variablename("Abcd_")
+        _type_check_variablename("Abcd_1234")
+        _type_check_variablename("Abcd1234_")
+
+    def test_split_keyword_arg(self):
+        self.assertTupleEqual(_split_keyword_arg("_A=b"), ("_A", "b"))
+        self.assertTupleEqual(_split_keyword_arg("a_=1"), ("a_", "1"))
+        self.assertTupleEqual(_split_keyword_arg("a=r(2, KEY_A)"), ("a", "r(2, KEY_A)"))
+        self.assertTupleEqual(_split_keyword_arg('a="=,#+."'), ("a", '"=,#+."'))
 
     async def test_is_this_a_macro(self):
         self.assertTrue(is_this_a_macro("k(1)"))
@@ -352,6 +392,21 @@ class TestMacros(unittest.IsolatedAsyncioTestCase):
         error = parse("foo(a)", self.context, True)
         self.assertIn("unknown", error.lower())
         self.assertIn("foo", error)
+
+        error = parse("set($a, 1)", self.context, True)
+        self.assertIsNotNone(error)
+        error = parse("set(1, 2)", self.context, True)
+        self.assertIsNotNone(error)
+        error = parse("set(+, 2)", self.context, True)
+        self.assertIsNotNone(error)
+        error = parse("set(a(), 2)", self.context, True)
+        self.assertIsNotNone(error)
+        error = parse("set('b,c', 2)", self.context, True)
+        self.assertIsNotNone(error)
+        error = parse('set("b,c", 2)', self.context, True)
+        self.assertIsNotNone(error)
+        error = parse("set(A, 2)", self.context, True)
+        self.assertIsNone(error)
 
     async def test_hold(self):
         # repeats k(a) as long as the key is held down
@@ -724,288 +779,6 @@ class TestMacros(unittest.IsolatedAsyncioTestCase):
         self.assertListEqual(self.result, [(5421, code, 154)])
         self.assertEqual(len(macro.child_macros), 1)
 
-    """ifeq"""
-
-    async def test_ifeq_runs(self):
-        macro = parse("set(foo, 2).ifeq(foo, 2, k(a), k(b))", self.context)
-        code_a = system_mapping.get("a")
-        code_b = system_mapping.get("b")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
-        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
-
-        await macro.run(self.handler)
-        self.assertListEqual(self.result, [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)])
-        self.assertEqual(len(macro.child_macros), 2)
-
-    async def test_ifeq_none(self):
-        # first param none
-        macro = parse("set(foo, 2).ifeq(foo, 2, , k(b))", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-        code_b = system_mapping.get("b")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_b})
-        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
-        await macro.run(self.handler)
-        self.assertListEqual(self.result, [])
-
-        # second param none
-        macro = parse("set(foo, 2).ifeq(foo, 2, k(a),)", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-        code_a = system_mapping.get("a")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a})
-        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
-        await macro.run(self.handler)
-        self.assertListEqual(self.result, [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)])
-
-    async def test_ifeq_unknown_key(self):
-        macro = parse("ifeq(qux, 2, k(a), k(b))", self.context)
-        code_a = system_mapping.get("a")
-        code_b = system_mapping.get("b")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
-        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
-
-        await macro.run(self.handler)
-        self.assertListEqual(self.result, [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)])
-        self.assertEqual(len(macro.child_macros), 2)
-
-    """if_eq"""
-
-    async def test_ifeq_runs_multiprocessed(self):
-        """ifeq on variables that have been set in other processes works."""
-        macro = parse("if_eq($foo, 3, k(a), k(b))", self.context)
-        code_a = system_mapping.get("a")
-        code_b = system_mapping.get("b")
-
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
-        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
-        self.assertEqual(len(macro.child_macros), 2)
-
-        def set_foo(value):
-            # will write foo = 2 into the shared dictionary of macros
-            macro_2 = parse(f"set(foo, {value})", self.context)
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(macro_2.run(lambda: None))
-
-        """foo is not 3"""
-
-        process = multiprocessing.Process(target=set_foo, args=(2,))
-        process.start()
-        process.join()
-        await macro.run(self.handler)
-        self.assertListEqual(self.result, [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)])
-
-        """foo is 3"""
-
-        process = multiprocessing.Process(target=set_foo, args=(3,))
-        process.start()
-        process.join()
-        await macro.run(self.handler)
-        self.assertListEqual(
-            self.result,
-            [
-                (EV_KEY, code_b, 1),
-                (EV_KEY, code_b, 0),
-                (EV_KEY, code_a, 1),
-                (EV_KEY, code_a, 0),
-            ],
-        )
-
-    async def test_if_eq(self):
-        code_a = system_mapping.get("a")
-        code_b = system_mapping.get("b")
-        a_press = [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)]
-        b_press = [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)]
-
-        async def test(macro, expected):
-            # cleanup
-            macro_variables._clear()
-            self.assertIsNone(macro_variables.get("a"))
-            self.result.clear()
-
-            # test
-            macro = parse(macro, self.context)
-            await macro.run(self.handler)
-            self.assertListEqual(self.result, expected)
-
-        await test("if_eq(1, 1, k(a), k(b))", a_press)
-        await test("if_eq(1, 2, k(a), k(b))", b_press)
-        await test('set(a, "foo").if_eq($a, "foo", k(a), k(b))', a_press)
-        await test('set(a, "foo").if_eq("foo", $a, k(a), k(b))', a_press)
-        await test('set(a, "foo").if_eq("foo", $a, , k(b))', [])
-        await test('set(a, "qux").if_eq("foo", $a, k(a), k(b))', b_press)
-        await test('set(a, "qux").if_eq($a, "foo", k(a), k(b))', b_press)
-        await test('set(a, "qux").if_eq($a, "foo", k(a), )', [])
-        await test('set(a, "x").set(b, "y").if_eq($b, $a, k(a), k(b))', b_press)
-        await test('set(a, "x").set(b, "y").if_eq($b, $a, k(a), )', [])
-        await test('set(a, "x").set(b, "x").if_eq($b, $a, k(a), k(b))', a_press)
-        await test('set(a, "x").set(b, "x").if_eq($b, $a, , k(b))', [])
-        await test("if_eq($q, $w, k(a), else=k(b))", a_press)  # both None
-        await test("set(q, 1).if_eq($q, $w, k(a), else=k(b))", b_press)
-        await test("set(q, 1).set(w, 1).if_eq($q, $w, k(a), else=k(b))", a_press)
-
-    """if_single"""
-
-    async def test_if_single(self):
-        macro = parse("if_single(k(x), k(y))", self.context)
-        self.assertEqual(len(macro.child_macros), 2)
-
-        a = system_mapping.get("a")
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.notify(new_event(EV_KEY, a, 1), PRESS)
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.notify(new_event(EV_KEY, a, 0), RELEASE)
-        # the key that triggered the macro is released
-        await asyncio.sleep(0.1)
-
-        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
-
-    async def test_if_single_ignores_releases(self):
-        macro = parse("if_single(k(x), k(y))", self.context)
-        self.assertEqual(len(macro.child_macros), 2)
-
-        a = system_mapping.get("a")
-        b = system_mapping.get("b")
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.notify(new_event(EV_KEY, a, 1), PRESS)
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.05)
-
-        # if_single only looks out for newly pressed keys,
-        # it doesn't care if keys were released that have been
-        # pressed before if_single. This was decided because it is a lot
-        # less tricky and more fluently to use if you type fast
-        macro.notify(new_event(EV_KEY, b, 0), RELEASE)
-        await asyncio.sleep(0.05)
-        self.assertListEqual(self.result, [])
-
-        # pressing an actual key triggers if_single
-        await asyncio.sleep(0.05)
-        macro.notify(new_event(EV_KEY, a, 1), PRESS)
-        await asyncio.sleep(0.05)
-        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
-
-    async def test_if_not_single(self):
-        # also works if if_single is a child macro
-        macro = parse("r(1, if_single(k(x), k(y)))", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-        self.assertEqual(len(macro.child_macros[0].child_macros), 2)
-
-        a = system_mapping.get("a")
-        b = system_mapping.get("b")
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.notify(new_event(EV_KEY, a, 1), PRESS)
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.notify(new_event(EV_KEY, b, 1), PRESS)
-        await asyncio.sleep(0.1)
-
-        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
-
-    async def test_if_not_single_none(self):
-        macro = parse("if_single(k(x),)", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-
-        a = system_mapping.get("a")
-        b = system_mapping.get("b")
-
-        x = system_mapping.get("x")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x})
-
-        macro.notify(new_event(EV_KEY, a, 1), PRESS)
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.notify(new_event(EV_KEY, b, 1), PRESS)
-        await asyncio.sleep(0.1)
-
-        self.assertListEqual(self.result, [])
-
-    """if_tap"""
-
-    async def test_if_tap(self):
-        macro = parse("if_tap(k(x), k(y), 100)", self.context)
-        self.assertEqual(len(macro.child_macros), 2)
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.press_key()
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.05)
-        macro.release_key()
-        await asyncio.sleep(0.05)
-
-        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
-
-    async def test_if_tap_none(self):
-        # first param none
-        macro = parse("if_tap(, k(y), 100)", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {y})
-        macro.press_key()
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.05)
-        macro.release_key()
-        await asyncio.sleep(0.05)
-        self.assertListEqual(self.result, [])
-
-        # second param none
-        macro = parse("if_tap(k(y), , 50)", self.context)
-        self.assertEqual(len(macro.child_macros), 1)
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {y})
-        macro.press_key()
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.release_key()
-        await asyncio.sleep(0.05)
-        self.assertListEqual(self.result, [])
-
-    async def test_if_not_tap(self):
-        macro = parse("if_tap(k(x), k(y), 50)", self.context)
-        self.assertEqual(len(macro.child_macros), 2)
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.press_key()
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.release_key()
-        await asyncio.sleep(0.05)
-
-        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
-
-    async def test_if_not_tap_named(self):
-        macro = parse("if_tap(k(x), k(y), timeout=50)", self.context)
-        self.assertEqual(len(macro.child_macros), 2)
-
-        x = system_mapping.get("x")
-        y = system_mapping.get("y")
-        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
-
-        macro.press_key()
-        asyncio.ensure_future(macro.run(self.handler))
-        await asyncio.sleep(0.1)
-        macro.release_key()
-        await asyncio.sleep(0.05)
-
-        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
-
     async def test_wait_for_event(self):
         macro = parse("h(a)", self.context)
 
@@ -1050,6 +823,321 @@ class TestMacros(unittest.IsolatedAsyncioTestCase):
 
         # k(KEY_B) is not executed, the macro stops
         self.assertListEqual(self.result, [])
+
+
+class TestIfEq(MacroTestBase):
+    async def test_ifeq_runs(self):
+        # deprecated ifeq function, but kept for compatibility reasons
+        macro = parse("set(foo, 2).ifeq(foo, 2, k(a), k(b))", self.context)
+        code_a = system_mapping.get("a")
+        code_b = system_mapping.get("b")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
+        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
+
+        await macro.run(self.handler)
+        self.assertListEqual(self.result, [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)])
+        self.assertEqual(len(macro.child_macros), 2)
+
+    async def test_ifeq_none(self):
+        # first param none
+        macro = parse("set(foo, 2).ifeq(foo, 2, , k(b))", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+        code_b = system_mapping.get("b")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_b})
+        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
+        await macro.run(self.handler)
+        self.assertListEqual(self.result, [])
+
+        # second param none
+        macro = parse("set(foo, 2).ifeq(foo, 2, k(a),)", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+        code_a = system_mapping.get("a")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a})
+        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
+        await macro.run(self.handler)
+        self.assertListEqual(self.result, [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)])
+
+    async def test_ifeq_unknown_key(self):
+        macro = parse("ifeq(qux, 2, k(a), k(b))", self.context)
+        code_a = system_mapping.get("a")
+        code_b = system_mapping.get("b")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
+        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
+
+        await macro.run(self.handler)
+        self.assertListEqual(self.result, [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)])
+        self.assertEqual(len(macro.child_macros), 2)
+
+    async def test_if_eq(self):
+        """new version of ifeq"""
+        code_a = system_mapping.get("a")
+        code_b = system_mapping.get("b")
+        a_press = [(EV_KEY, code_a, 1), (EV_KEY, code_a, 0)]
+        b_press = [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)]
+
+        async def test(macro, expected):
+            # cleanup
+            macro_variables._clear()
+            self.assertIsNone(macro_variables.get("a"))
+            self.result.clear()
+
+            # test
+            macro = parse(macro, self.context)
+            await macro.run(self.handler)
+            self.assertListEqual(self.result, expected)
+
+        await test("if_eq(1, 1, k(a), k(b))", a_press)
+        await test("if_eq(1, 2, k(a), k(b))", b_press)
+        await test('set(a, "foo").if_eq($a, "foo", k(a), k(b))', a_press)
+        await test('set(a, "foo").if_eq("foo", $a, k(a), k(b))', a_press)
+        await test('set(a, "foo").if_eq("foo", $a, , k(b))', [])
+        await test('set(a, "qux").if_eq("foo", $a, k(a), k(b))', b_press)
+        await test('set(a, "qux").if_eq($a, "foo", k(a), k(b))', b_press)
+        await test('set(a, "qux").if_eq($a, "foo", k(a), )', [])
+        await test('set(a, "x").set(b, "y").if_eq($b, $a, k(a), k(b))', b_press)
+        await test('set(a, "x").set(b, "y").if_eq($b, $a, k(a), )', [])
+        await test('set(a, "x").set(b, "x").if_eq($b, $a, k(a), k(b))', a_press)
+        await test('set(a, "x").set(b, "x").if_eq($b, $a, , k(b))', [])
+        await test("if_eq($q, $w, k(a), else=k(b))", a_press)  # both None
+        await test("set(q, 1).if_eq($q, $w, k(a), else=k(b))", b_press)
+        await test("set(q, 1).set(w, 1).if_eq($q, $w, k(a), else=k(b))", a_press)
+
+    async def test_if_eq_runs_multiprocessed(self):
+        """ifeq on variables that have been set in other processes works."""
+        macro = parse("if_eq($foo, 3, k(a), k(b))", self.context)
+        code_a = system_mapping.get("a")
+        code_b = system_mapping.get("b")
+
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {code_a, code_b})
+        self.assertSetEqual(macro.get_capabilities()[EV_REL], set())
+        self.assertEqual(len(macro.child_macros), 2)
+
+        def set_foo(value):
+            # will write foo = 2 into the shared dictionary of macros
+            macro_2 = parse(f"set(foo, {value})", self.context)
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(macro_2.run(lambda: None))
+
+        """foo is not 3"""
+
+        process = multiprocessing.Process(target=set_foo, args=(2,))
+        process.start()
+        process.join()
+        await macro.run(self.handler)
+        self.assertListEqual(self.result, [(EV_KEY, code_b, 1), (EV_KEY, code_b, 0)])
+
+        """foo is 3"""
+
+        process = multiprocessing.Process(target=set_foo, args=(3,))
+        process.start()
+        process.join()
+        await macro.run(self.handler)
+        self.assertListEqual(
+            self.result,
+            [
+                (EV_KEY, code_b, 1),
+                (EV_KEY, code_b, 0),
+                (EV_KEY, code_a, 1),
+                (EV_KEY, code_a, 0),
+            ],
+        )
+
+
+class TestIfSingle(MacroTestBase):
+    async def test_if_single(self):
+        macro = parse("if_single(k(x), k(y))", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        a = system_mapping.get("a")
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.notify(new_event(EV_KEY, a, 0), RELEASE)
+        # the key that triggered the macro is released
+        await asyncio.sleep(0.1)
+
+        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
+        self.assertFalse(macro.running)
+
+    async def test_if_single_ignores_releases(self):
+        # the timeout won't break the macro, everything happens well within that
+        # timeframe.
+        macro = parse("if_single(k(x), k(y), timeout=100000)", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        a = system_mapping.get("a")
+        b = system_mapping.get("b")
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.05)
+
+        # if_single only looks out for newly pressed keys,
+        # it doesn't care if keys were released that have been
+        # pressed before if_single. This was decided because it is a lot
+        # less tricky and more fluently to use if you type fast
+        macro.notify(new_event(EV_KEY, b, 0), RELEASE)
+        await asyncio.sleep(0.05)
+        self.assertListEqual(self.result, [])
+
+        # pressing an actual key triggers if_single
+        await asyncio.sleep(0.05)
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        await asyncio.sleep(0.05)
+        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
+        self.assertFalse(macro.running)
+
+    async def test_if_not_single(self):
+        # Will run the `else` macro if another key is pressed.
+        # Also works if if_single is a child macro, i.e. the event is passed to it
+        # from the outside macro correctly.
+        macro = parse("r(1, if_single(k(x), k(y)))", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+        self.assertEqual(len(macro.child_macros[0].child_macros), 2)
+
+        a = system_mapping.get("a")
+        b = system_mapping.get("b")
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.notify(new_event(EV_KEY, b, 1), PRESS)
+        await asyncio.sleep(0.1)
+
+        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
+        self.assertFalse(macro.running)
+
+    async def test_if_not_single_none(self):
+        macro = parse("if_single(k(x),)", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+
+        a = system_mapping.get("a")
+        b = system_mapping.get("b")
+
+        x = system_mapping.get("x")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x})
+
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.notify(new_event(EV_KEY, b, 1), PRESS)
+        await asyncio.sleep(0.1)
+
+        self.assertListEqual(self.result, [])
+        self.assertFalse(macro.running)
+
+    async def test_if_single_times_out(self):
+        macro = parse("set(t, 300).if_single(k(x), k(y), timeout=$t)", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        a = system_mapping.get("a")
+        y = system_mapping.get("y")
+
+        macro.notify(new_event(EV_KEY, a, 1), PRESS)
+        asyncio.ensure_future(macro.run(self.handler))
+
+        # no timeout yet
+        await asyncio.sleep(0.2)
+        self.assertListEqual(self.result, [])
+        self.assertTrue(macro.running)
+
+        # times out now
+        await asyncio.sleep(0.2)
+        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
+        self.assertFalse(macro.running)
+
+
+class TestIfTap(MacroTestBase):
+    async def test_if_tap(self):
+        macro = parse("if_tap(k(x), k(y), 100)", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.press_key()
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.05)
+        macro.release_key()
+        await asyncio.sleep(0.05)
+
+        self.assertListEqual(self.result, [(EV_KEY, x, 1), (EV_KEY, x, 0)])
+        self.assertFalse(macro.running)
+
+    async def test_if_tap_none(self):
+        # first param none
+        macro = parse("if_tap(, k(y), 100)", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {y})
+        macro.press_key()
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.05)
+        macro.release_key()
+        await asyncio.sleep(0.05)
+        self.assertListEqual(self.result, [])
+
+        # second param none
+        macro = parse("if_tap(k(y), , 50)", self.context)
+        self.assertEqual(len(macro.child_macros), 1)
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {y})
+        macro.press_key()
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.release_key()
+        await asyncio.sleep(0.05)
+        self.assertListEqual(self.result, [])
+
+        self.assertFalse(macro.running)
+
+    async def test_if_not_tap(self):
+        macro = parse("if_tap(k(x), k(y), 50)", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.press_key()
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.release_key()
+        await asyncio.sleep(0.05)
+
+        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
+        self.assertFalse(macro.running)
+
+    async def test_if_not_tap_named(self):
+        macro = parse("if_tap(k(x), k(y), timeout=50)", self.context)
+        self.assertEqual(len(macro.child_macros), 2)
+
+        x = system_mapping.get("x")
+        y = system_mapping.get("y")
+        self.assertSetEqual(macro.get_capabilities()[EV_KEY], {x, y})
+
+        macro.press_key()
+        asyncio.ensure_future(macro.run(self.handler))
+        await asyncio.sleep(0.1)
+        macro.release_key()
+        await asyncio.sleep(0.05)
+
+        self.assertListEqual(self.result, [(EV_KEY, y, 1), (EV_KEY, y, 0)])
+        self.assertFalse(macro.running)
 
 
 if __name__ == "__main__":

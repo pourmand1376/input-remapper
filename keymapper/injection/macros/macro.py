@@ -37,6 +37,7 @@ w(1000).m(Shift_L, r(2, k(a))).w(10).k(b): <1s> A A <10ms> b
 
 import asyncio
 import copy
+import re
 
 from evdev.ecodes import ecodes, EV_KEY, EV_REL, REL_X, REL_Y, REL_WHEEL, REL_HWHEEL
 
@@ -99,6 +100,19 @@ def _type_check_keyname(name):
     return code
 
 
+def _type_check_variablename(name):
+    """Check if this is a legit variable name.
+
+    Because they could clash with language features. If the macro is able to be
+    parsed at all due to a problematic choice of a variable name.
+
+    Allowed examples: "foo", "Foo1234_", "_foo_1234"
+    Not allowed: "1_foo", "foo=blub", "$foo", "foo,1234", "foo()"
+    """
+    if not isinstance(name, str) or not re.match(r"^[A-Za-z_][A-Za-z_0-9]*$", name):
+        raise SyntaxError(f'"{name}" is not a legit variable name')
+
+
 def _resolve(argument, allowed_types=None):
     """If the argument starts with a $, then figure out its value.
 
@@ -109,9 +123,6 @@ def _resolve(argument, allowed_types=None):
         variable_name = argument.split("$", 1)[1]
         value = macro_variables.get(variable_name)
         logger.debug('"%s" is "%s"', argument, value)
-        # TODO what will macros do if _type_check fails during runtime?
-        #   apparently the error is only thrown once, future clicks don't print
-        #   stack traces anymore
         if allowed_types:
             return _type_check(value, allowed_types)
         else:
@@ -483,6 +494,7 @@ class Macro:
 
     def add_set(self, variable, value):
         """Set a variable to a certain value."""
+        _type_check_variablename(variable)
 
         async def task(_):
             # can also copy with set(a, $b)
@@ -551,9 +563,9 @@ class Macro:
             self.child_macros.append(_else)
 
         async def task(handler):
+            coroutine = self._holding_event.wait()
+            resolved_timeout = _resolve(timeout, [int, float]) / 1000
             try:
-                coroutine = self._holding_event.wait()
-                resolved_timeout = _resolve(timeout, [int, float]) / 1000
                 await asyncio.wait_for(coroutine, resolved_timeout)
                 if then:
                     await then.run(handler)
@@ -563,7 +575,7 @@ class Macro:
 
         self.tasks.append(task)
 
-    def add_if_single(self, then, otherwise):
+    def add_if_single(self, then, otherwise, timeout=None):
         """If a key was pressed without combining it."""
         _type_check(then, [Macro, None], "if_single", 1)
         _type_check(otherwise, [Macro, None], "if_single", 2)
@@ -586,14 +598,25 @@ class Macro:
                 if action in (PRESS, PRESS_NEGATIVE):
                     return True
 
-            await self.wait_for_event(event_filter)
+            coroutine = self.wait_for_event(event_filter)
+            resolved_timeout = _resolve(timeout, allowed_types=[int, float, None])
+            try:
+                if resolved_timeout is not None:
+                    await asyncio.wait_for(coroutine, resolved_timeout / 1000)
+                else:
+                    await coroutine
 
-            mappable_event_2 = (self._newest_event.type, self._newest_event.code)
+                mappable_event_2 = (self._newest_event.type, self._newest_event.code)
+                combined = mappable_event_1 != mappable_event_2
+                if not combined:
+                    # no timeout and not combined
+                    if then:
+                        await then.run(handler)
+                    return
+            except asyncio.TimeoutError:
+                pass
 
-            combined = mappable_event_1 != mappable_event_2
-            if then and not combined:
-                await then.run(handler)
-            elif otherwise:
+            if otherwise:
                 await otherwise.run(handler)
 
         self.tasks.append(task)

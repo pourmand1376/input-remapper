@@ -8,7 +8,7 @@
   Allows mapping non-keyboard events (click, joystick, wheel) to keys of keyboard devices.
 </p>
 
-<p align="center"><a href="readme/usage.md">Usage</a> - <a href="readme/macros.md">Macros</a> - <a href="#installation">Installation</a> - <a href="readme/development.md">Development</a> - <a href="#screenshots">Screenshots</a> - <a href="readme/development.md">Examples</a></p>
+<p align="center"><a href="readme/usage.md">Usage</a> - <a href="readme/macros.md">Macros</a> - <a href="#installation">Installation</a> - <a href="readme/development.md">Development</a> - <a href="#screenshots">Screenshots</a> - <a href="readme/examples.md">Examples</a></p>
 
 <p align="center"><img src="readme/pylint.svg"/> <img src="readme/coverage.svg"/></p>
 
@@ -37,7 +37,7 @@ key-mapper is now part of [Debian Testing](https://packages.debian.org/testing/k
 ##### pip
 
 ```bash
-sudo pip install git+https://github.com/sezanzeb/key-mapper.git
+sudo pip install --no-binary :all: git+https://github.com/sezanzeb/key-mapper.git
 sudo systemctl enable key-mapper
 sudo systemctl restart key-mapper
 ```
