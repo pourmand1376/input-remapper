@@ -27,7 +27,7 @@ import traceback
 import inspect
 
 from keymapper.logger import logger
-from keymapper.injection.macros.macro import Macro
+from keymapper.injection.macros.macro import Macro, Variable
 
 
 def is_this_a_macro(output):
@@ -104,7 +104,15 @@ def _extract_args(inner):
     brackets = 0
     params = []
     start = 0
+    string = False
     for position, char in enumerate(inner):
+        # ignore anything between string quotes
+        if char == '"':
+            string = not string
+        if string:
+            continue
+
+        # ignore commas inside child macros
         if char == "(":
             brackets += 1
         if char == ")":
@@ -158,51 +166,78 @@ def _split_keyword_arg(param):
     return None, param
 
 
-def _parse_recurse(macro, context, macro_instance=None, depth=0):
+def _is_number(value):
+    """Check if the value can be turned into a number."""
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_recurse(code, context, macro_instance=None, depth=0):
     """Handle a subset of the macro, e.g. one parameter or function call.
+
+    Not using eval for security reasons.
 
     Parameters
     ----------
-    macro : string
-        Just like parse
+    code : string
+        Just like parse. A single parameter or the complete macro as string.
+        Comments and redundant whitespace characters are expected to be removed already.
     context : Context
     macro_instance : Macro or None
         A macro instance to add tasks to
     depth : int
         For logging porposes
     """
-    # not using eval for security reasons
-    assert isinstance(macro, str)
+    assert isinstance(code, str)
     assert isinstance(depth, int)
 
-    if macro == "":
-        return None
-
-    if macro_instance is None:
-        macro_instance = Macro(macro, context)
-    else:
-        assert isinstance(macro_instance, Macro)
-
-    macro = macro.strip()
     space = "  " * depth
 
+    code = code.strip()
+
+    if code == "":
+        return None
+
+    if code.startswith('"'):
+        # a string, don't parse. remove quotes
+        string = code[1:-1]
+        logger.spam("%sstring %s", space, string)
+        return string
+
+    if code.startswith("$"):
+        # will be resolved during the macros runtime
+        return Variable(code.split("$", 1)[1])
+
+    if _is_number(code):
+        if "." in code:
+            code = float(code)
+        else:
+            code = int(code)
+        logger.spam("%snumber %s", space, code)
+        return code
+
     # is it another macro?
-    call_match = re.match(r"^(\w+)\(", macro)
+    call_match = re.match(r"^(\w+)\(", code)
     call = call_match[1] if call_match else None
     if call is not None:
-        # available functions in the macro and the minimum and maximum number
-        # of their arguments
+        if macro_instance is None:
+            macro_instance = Macro(code, context)
+        else:
+            assert isinstance(macro_instance, Macro)
+
         function = FUNCTIONS.get(call)
         if function is None:
             raise Exception(f"Unknown function {call}")
 
         # get all the stuff inbetween
-        position = _count_brackets(macro)
-
-        inner = macro[macro.index("(") + 1 : position - 1]
+        position = _count_brackets(code)
+        inner = code[code.index("(") + 1 : position - 1]
         logger.spam("%scalls %s with %s", space, call, inner)
 
-        # split "3, foo=k(a).w(10)" into arguments
+        # split "3, foo=a(2, k(a).w(10))" into arguments
         raw_string_args = _extract_args(inner)
 
         # parse and sort the params
@@ -238,7 +273,7 @@ def _parse_recurse(macro, context, macro_instance=None, depth=0):
                     f"not {num_provided_args} parameters"
                 )
             else:
-                msg = f"{call} takes {min_args}, " f"not {num_provided_args} parameters"
+                msg = f"{call} takes {min_args}, not {num_provided_args} parameters"
 
             raise ValueError(msg)
 
@@ -247,23 +282,18 @@ def _parse_recurse(macro, context, macro_instance=None, depth=0):
         function(macro_instance, *positional_args, **keyword_args)
 
         # is after this another call? Chain it to the macro_instance
-        if len(macro) > position and macro[position] == ".":
-            chain = macro[position + 1 :]
+        if len(code) > position and code[position] == ".":
+            chain = code[position + 1 :]
             logger.spam("%sfollowed by %s", space, chain)
             _parse_recurse(chain, context, macro_instance, depth)
 
         return macro_instance
 
-    # probably a simple parameter
-    try:
-        # if possible, parse as int
-        macro = int(macro)
-    except ValueError:
-        # use as string instead
-        pass
-
-    logger.spam("%s%s %s", space, type(macro), macro)
-    return macro
+    # It is probably either a key name like KEY_A or a variable name as in `set(var,1)`,
+    # both won't contain special characters that can break macro syntax so they don't
+    # have to be wrapped in quotes.
+    logger.spam("%sstring %s", space, code)
+    return code
 
 
 def handle_plus_syntax(macro):
@@ -294,6 +324,46 @@ def handle_plus_syntax(macro):
     return output
 
 
+def _remove_whitespaces(macro, delimiter='"'):
+    """Remove whitespaces, tabs, newlines and such outside of string quotes."""
+    result = ""
+    for i, chunk in enumerate(macro.split(delimiter)):
+        # every second chunk is inside string quotes
+        if i % 2 == 0:
+            result += re.sub(r"\s", "", chunk)
+        else:
+            result += chunk
+        result += delimiter
+
+    # one extra delimiter was added
+    return result[: -len(delimiter)]
+
+
+def _remove_comments(macro):
+    """Remove comments from the macro and return the resulting code."""
+    # keep hashtags inside quotes intact
+    result = ""
+
+    for i, line in enumerate(macro.split("\n")):
+        for j, chunk in enumerate(line.split('"')):
+            if j > 0:
+                # add back the string quote
+                chunk = f'"{chunk}'
+
+            # every second chunk is inside string quotes
+            if j % 2 == 0 and "#" in chunk:
+                # everything from now on is a comment and can be ignored
+                result += chunk.split("#")[0]
+                break
+            else:
+                result += chunk
+
+        if i < macro.count("\n"):
+            result += "\n"
+
+    return result
+
+
 def parse(macro, context, return_errors=False):
     """parse and generate a Macro that can be run as often as you want.
 
@@ -304,7 +374,7 @@ def parse(macro, context, return_errors=False):
     ----------
     macro : string
         "r(3, k(a).w(10))"
-        "r(2, k(a).k(-)).k(b)"
+        "r(2, k(a).k(KEY_A)).k(b)"
         "w(1000).m(Shift_L, r(2, k(a))).w(10, 20).k(b)"
     context : Context
     return_errors : bool
@@ -313,13 +383,9 @@ def parse(macro, context, return_errors=False):
     """
     macro = handle_plus_syntax(macro)
 
-    # whitespaces, tabs, newlines and such don't serve a purpose. make
-    # the log output clearer and the parsing easier.
-    macro = re.sub(r"\s", "", macro)
+    macro = _remove_comments(macro)
 
-    if '"' in macro or "'" in macro:
-        logger.info("Quotation marks in macros are not needed")
-        macro = macro.replace('"', "").replace("'", "")
+    macro = _remove_whitespaces(macro, '"')
 
     if return_errors:
         logger.spam("checking the syntax of %s", macro)
