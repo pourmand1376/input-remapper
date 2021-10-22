@@ -27,8 +27,9 @@ import grp
 import sys
 import argparse
 import logging
+import subprocess
 
-from keymapper.logger import logger, update_verbosity, log_info
+from keymapper.logger import logger, update_verbosity, log_info, add_filehandler
 from keymapper.config import config
 
 # import keymapper modules as late as possible to make sure the correct
@@ -75,12 +76,10 @@ def utils(options):
         from keymapper.groups import groups
         for group in groups:
             print(group.key)
-        sys.exit(0)
 
     if options.key_names:
         from keymapper.system_mapping import system_mapping
         print('\n'.join(system_mapping.list_names()))
-        sys.exit(0)
 
 
 def communicate(options, daemon):
@@ -101,13 +100,18 @@ def communicate(options, daemon):
             group = groups.find(key=options.device)
 
         if group is None:
-            logger.error('unknown device "%s"', options.device)
+            logger.error(
+                'Device "%s" is unknown or not an appropriate input device',
+                options.device
+            )
             sys.exit(1)
 
         return group
 
     if daemon is None:
-        sys.exit(0)
+        # probably broken tests
+        logger.error('Daemon missing')
+        sys.exit(1)
 
     if options.config_dir is not None:
         path = os.path.abspath(os.path.expanduser(os.path.join(
@@ -133,10 +137,14 @@ def communicate(options, daemon):
         # if device was specified, autoload for that one. if None autoload
         # for all devices.
         if options.device is None:
-            daemon.autoload()
+            logger.info('Autoloading all')
+            # timeout is not documented, for more info see
+            # https://github.com/LEW21/pydbus/blob/master/pydbus/proxy_method.py
+            daemon.autoload(timeout=10)
         else:
             group = require_group()
-            daemon.autoload_single(group.key)
+            logger.info('Asking daemon to autoload for %s', options.device)
+            daemon.autoload_single(group.key, timeout=2)
 
     if options.command == START:
         group = require_group()
@@ -179,6 +187,50 @@ def internals(options):
     os.system(cmd)
 
 
+def num_logged_in_users():
+    """Check how many users are logged in."""
+    who = subprocess.run(['who'], stdout=subprocess.PIPE).stdout.decode()
+    return len([user for user in who.split('\n') if user.strip() != ""])
+
+
+def main(options):
+    if options.debug:
+        update_verbosity(True)
+
+    add_filehandler('/var/log/key-mapper-control')
+
+    if options.version:
+        log_info()
+        return
+
+    logger.debug('Call for "%s"', sys.argv)
+
+    if options.command == AUTOLOAD and num_logged_in_users() == 0:
+        # No user logged in, this is probably happening during boot time and got
+        # triggered by udev. There is no need to try to inject anything if the
+        # service doesn't know where to look for a config file. This avoids a lot
+        # of confusing service logs. And also avoids potential for problems when
+        # key-mapper-control stresses about evdev, dbus and multiprocessing already
+        # while the system hasn't even booted completely.
+        logger.warning('Skipping autoload command without a logged in user')
+        return
+
+    if options.command is not None:
+        if options.command in INTERNALS:
+            internals(options)
+        elif options.command in COMMANDS:
+            from keymapper.daemon import Daemon
+            daemon = Daemon.connect(fallback=False)
+            communicate(options, daemon)
+        else:
+            logger.error('Unknown command "%s"', options.command)
+    else:
+        utils(options)
+
+    if options.command:
+        logger.info('Done')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -212,7 +264,7 @@ if __name__ == '__main__':
         default=False
     )
     parser.add_argument(
-        '-n', '--symbol-names', action='store_true', dest='key_names',
+        '--symbol-names', action='store_true', dest='key_names',
         help='Print all available names for the mapping',
         default=False
     )
@@ -226,24 +278,4 @@ if __name__ == '__main__':
         help='Print the version and exit', default=False
     )
 
-    options = parser.parse_args(sys.argv[1:])
-
-    if options.version:
-        log_info()
-        sys.exit(0)
-
-    update_verbosity(options.debug)
-
-    logger.debug('Call for "%s"', sys.argv)
-
-    if options.command is not None:
-        if options.command in INTERNALS:
-            internals(options)
-        elif options.command in COMMANDS:
-            from keymapper.daemon import Daemon
-            daemon = Daemon.connect(fallback=False)
-            communicate(options, daemon)
-        else:
-            logger.error('Unknown command "%s"', options.command)
-    else:
-        utils(options)
+    main(parser.parse_args(sys.argv[1:]))

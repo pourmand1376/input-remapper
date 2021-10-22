@@ -88,7 +88,7 @@ class Injector(multiprocessing.Process):
     regrab_timeout = 0.2
 
     def __init__(self, group, mapping):
-        """Setup a process to start injecting keycodes based on custom_mapping.
+        """
 
         Parameters
         ----------
@@ -333,7 +333,7 @@ class Injector(multiprocessing.Process):
         #   - SharedDict becomes obsolete
         #   - quick_cleanup needs to be able to reliably stop the injection
         #   - I think I want an event listener architecture so that macros,
-        #     event_producer, keycode_mapper and possibly other modules can get
+        #     joystick_to_mouse, keycode_mapper and possibly other modules can get
         #     what they filter for whenever they want, without having to wire
         #     things through multiple other objects all the time
         #   - _new_event_arrived moves to the place where events are emitted. injector?
@@ -349,7 +349,7 @@ class Injector(multiprocessing.Process):
         logger.info('Starting injecting the mapping for "%s"', self.group.key)
 
         # create a new event loop, because somehow running an infinite loop
-        # that sleeps on iterations (event_producer) in one process causes
+        # that sleeps on iterations (joystick_to_mouse) in one process causes
         # another injection process to screw up reading from the grabbed
         # device.
         loop = asyncio.new_event_loop()
@@ -409,15 +409,19 @@ class Injector(multiprocessing.Process):
             # stopped event loop most likely
             pass
         except OSError as error:
-            logger.error(str(error))
+            logger.error("Failed to run injector coroutines: %s", str(error))
 
         if len(coroutines) > 0:
             # expected when stop_injecting is called,
             # during normal operation as well as tests this point is not
             # reached otherwise.
-            logger.debug("asyncio coroutines ended")
+            logger.debug("Injector coroutines ended")
 
         for source in sources:
             # ungrab at the end to make the next injection process not fail
             # its grabs
-            source.ungrab()
+            try:
+                source.ungrab()
+            except OSError as error:
+                # it might have disappeared
+                logger.debug("OSError for ungrab on %s: %s", source.path, str(error))

@@ -27,6 +27,7 @@ import shutil
 import time
 import logging
 import pkg_resources
+from datetime import datetime
 
 from keymapper.user import HOME
 
@@ -124,7 +125,7 @@ class Formatter(logging.Formatter):
             }.get(record.levelno, 0)
 
             if debug:
-                delta = f"{str(time.time() - start)[:7]}"
+                delta = datetime.now().strftime("%H:%M:%S.%f")
                 self._style._fmt = (  # noqa
                     f"\033[{color}m"  # color
                     f"{os.getpid()} "
@@ -200,22 +201,27 @@ def update_verbosity(debug):
 
 def add_filehandler(log_path=LOG_PATH):
     """Clear the existing logfile and start logging to it."""
-    logger.info('This output is also stored in "%s"', LOG_PATH)
+    try:
+        log_path = os.path.expanduser(log_path)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-    log_path = os.path.expanduser(log_path)
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
-    if os.path.exists(log_path):
-        # keep the log path small, start from scratch each time
         if os.path.isdir(log_path):
             # used to be a folder < 0.8.0
             shutil.rmtree(log_path)
-        else:
-            os.remove(log_path)
 
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(Formatter())
+        if os.path.exists(log_path):
+            # the logfile should not be too long to avoid overflowing the storage
+            with open(log_path, "r") as file:
+                content = file.readlines()[-1000:]
 
-    logger.info('Logging to "%s"', log_path)
+            with open(log_path, "w") as file:
+                file.truncate(0)
+                file.writelines(content)
 
-    logger.addHandler(file_handler)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(Formatter())
+        logger.addHandler(file_handler)
+
+        logger.info('Starting logging to "%s"', log_path)
+    except PermissionError:
+        logger.debug('No permission to log to "%s"', log_path)

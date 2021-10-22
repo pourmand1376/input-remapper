@@ -34,7 +34,6 @@ and the injector.
 import re
 import multiprocessing
 import threading
-import time
 import asyncio
 import json
 
@@ -203,6 +202,8 @@ def is_denylisted(device):
         if re.match(name, str(device.name), re.IGNORECASE):
             return True
 
+    return False
+
 
 def get_unique_key(device):
     """Find a string key that is unique for a single hardware device.
@@ -338,7 +339,16 @@ class _FindGroups(threading.Thread):
         # "Logitech USB Keyboard" and "Logitech USB Keyboard Consumer Control"
         grouped = {}
         for path in evdev.list_devices():
-            device = evdev.InputDevice(path)
+            try:
+                device = evdev.InputDevice(path)
+            except Exception as error:
+                # Observed exceptions in journalctl:
+                # - "SystemError: <built-in function ioctl_EVIOCGVERSION> returned NULL
+                # without setting an error"
+                # - "FileNotFoundError: [Errno 2] No such file or directory:
+                # '/dev/input/event12'"
+                logger.error("Failed to access %s: %s", path, str(error))
+                continue
 
             if device.name == "Power Button":
                 continue
@@ -405,21 +415,21 @@ class _Groups:
     """Contains and manages all groups."""
 
     def __init__(self):
-        self._groups = {}
-        self._find_groups()
+        self._groups = None
+
+    def __getattribute__(self, key):
+        """To lazy load group info only when needed.
+
+        For example, this helps to keep logs of key-mapper-control clear when it doesnt
+        need it the information.
+        """
+        if key == "_groups" and object.__getattribute__(self, "_groups") is None:
+            object.__setattr__(self, "_groups", {})
+            object.__getattribute__(self, "refresh")()
+
+        return object.__getattribute__(self, key)
 
     def refresh(self):
-        """This can be called to discover new devices.
-
-        Only call this if appropriate permissions are available, otherwise
-        the object may be empty afterwards.
-        """
-        # it may take a little bit of time until devices are visible after
-        # changes
-        time.sleep(0.1)
-        return self._find_groups()
-
-    def _find_groups(self):
         """Look for devices and group them together.
 
         Since this needs to do some stuff with /dev and spawn processes the
@@ -475,7 +485,7 @@ class _Groups:
         """Load a serialized representation created via dumps."""
         self._groups = [_Group.loads(group) for group in json.loads(dump)]
 
-    def find(self, name=None, key=None, path=None):
+    def find(self, name=None, key=None, path=None, include_keymapper=False):
         """Find a group that matches the provided parameters.
 
         Parameters
@@ -489,6 +499,9 @@ class _Groups:
             "/dev/input/event3"
         """
         for group in self._groups:
+            if not include_keymapper and group.name.startswith("key-mapper"):
+                continue
+
             if name and group.name != name:
                 continue
 

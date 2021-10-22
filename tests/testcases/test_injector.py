@@ -46,7 +46,7 @@ from evdev.ecodes import (
     KEY_C,
 )
 
-from keymapper.injection.consumers.event_producer import EventProducer
+from keymapper.injection.consumers.joystick_to_mouse import JoystickToMouse
 from keymapper.injection.injector import (
     Injector,
     is_in_capabilities,
@@ -83,6 +83,13 @@ from tests.test import (
 )
 
 
+def wait_for_uinput_write():
+    start = time.time()
+    if not uinput_write_history_pipe[0].poll(timeout=10):
+        raise AssertionError("No event written within 10 seconds")
+    return float(time.time() - start)
+
+
 class TestInjector(unittest.IsolatedAsyncioTestCase):
     new_gamepad_path = "/dev/input/event100"
 
@@ -112,12 +119,12 @@ class TestInjector(unittest.IsolatedAsyncioTestCase):
 
         quick_cleanup()
 
-    def find_event_producer(self):
+    def find_joystick_to_mouse(self):
         # this object became somewhat a pain to retreive
         return [
             consumer
             for consumer in self.injector._consumer_controls[0]._consumers
-            if isinstance(consumer, EventProducer)
+            if isinstance(consumer, JoystickToMouse)
         ][0]
 
     def test_grab(self):
@@ -464,7 +471,7 @@ class TestInjector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.count((EV_ABS, ABS_RZ, value)), 1)
 
     @mock.patch("evdev.InputDevice.ungrab")
-    def test_gamepad_to_mouse_event_producer(self, ungrab_patch):
+    def test_gamepad_to_mouse_joystick_to_mouse(self, ungrab_patch):
         custom_mapping.set("gamepad.joystick.left_purpose", MOUSE)
         custom_mapping.set("gamepad.joystick.right_purpose", NONE)
         self.injector = Injector(groups.find(name="gamepad"), custom_mapping)
@@ -478,13 +485,13 @@ class TestInjector(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.injector.context)
 
         # not in a process because this doesn't call start, so the
-        # event_producer state can be checked
+        # joystick_to_mouse state can be checked
         self.injector.run()
 
-        event_producer = self.find_event_producer()
+        joystick_to_mouse = self.find_joystick_to_mouse()
 
-        self.assertEqual(event_producer._abs_range[0], MIN_ABS)
-        self.assertEqual(event_producer._abs_range[1], MAX_ABS)
+        self.assertEqual(joystick_to_mouse._abs_range[0], MIN_ABS)
+        self.assertEqual(joystick_to_mouse._abs_range[1], MAX_ABS)
         self.assertEqual(
             self.injector.context.mapping.get("gamepad.joystick.left_purpose"), MOUSE
         )
@@ -748,10 +755,6 @@ class TestInjector(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(history.count((EV_KEY, code_d, 0)), 1)
 
     def test_wheel(self):
-        # this tests both keycode_mapper and event_producer, and it seems
-        # to test stuff not covered in test_keycode_mapper, so it's a quite
-        # important one.
-
         # wheel release events are made up with a debouncer
 
         # map those two to stuff
@@ -798,20 +801,25 @@ class TestInjector(unittest.IsolatedAsyncioTestCase):
         event = uinput_write_history_pipe[0].recv()
         self.assertEqual(event.t, (EV_KEY, code_c, 1))
 
-        time.sleep(EVENT_READ_TIMEOUT * 5)
-        # in 5 more read-loop ticks, nothing new should have happened
-        self.assertFalse(uinput_write_history_pipe[0].poll())
+        # in 5 more read-loop ticks, nothing new should have happened.
+        # add a bit of a head-start of one EVENT_READ_TIMEOUT to avoid race-conditions
+        # in tests
+        self.assertFalse(
+            uinput_write_history_pipe[0].poll(timeout=EVENT_READ_TIMEOUT * 6)
+        )
 
-        time.sleep(EVENT_READ_TIMEOUT * 6)
         # 5 more and it should be within the second phase in which
         # the horizontal wheel is used. add some tolerance
-        self.assertTrue(uinput_write_history_pipe[0].poll())
+        self.assertAlmostEqual(
+            wait_for_uinput_write(), EVENT_READ_TIMEOUT * 5, delta=EVENT_READ_TIMEOUT
+        )
         event = uinput_write_history_pipe[0].recv()
         self.assertEqual(event.t, (EV_KEY, code_b, 1))
 
         time.sleep(EVENT_READ_TIMEOUT * 10 + 5 / 60)
         # after 21 read-loop ticks all events should be consumed, wait for
-        # at least 3 (=5) producer-ticks so that the debouncers are triggered.
+        # at least 3 (lets use 5 so that the test passes even if it lags)
+        # ticks so that the debouncers are triggered.
         # Key-up events for both wheel events should be written now that no
         # new key-down event arrived.
         events = read_write_history_pipe()

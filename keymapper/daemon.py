@@ -43,9 +43,14 @@ from keymapper.mapping import Mapping
 from keymapper.config import config
 from keymapper.system_mapping import system_mapping
 from keymapper.groups import groups
+from keymapper.paths import get_config_path, USER
+from keymapper.injection.macros.macro import macro_variables
 
 
 BUS_NAME = "keymapper.Control"
+# timeout in seconds, see
+# https://github.com/LEW21/pydbus/blob/cc407c8b1d25b7e28a6d661a29f9e661b1c9b964/pydbus/proxy.py
+BUS_TIMEOUT = 10
 
 
 class AutoloadHistory:
@@ -97,6 +102,19 @@ class AutoloadHistory:
         return False
 
 
+def remove_timeout(func):
+    """Remove timeout to ensure the call works if the daemon is not a proxy."""
+    # the timeout kwarg is a feature of pydbus. This is needed to make tests work
+    # that create a Daemon by calling its constructor instead of using pydbus.
+    def wrapped(*args, **kwargs):
+        if "timeout" in kwargs:
+            del kwargs["timeout"]
+
+        return func(*args, **kwargs)
+
+    return wrapped
+
+
 class Daemon:
     """Starts injecting keycodes based on the configuration.
 
@@ -146,12 +164,23 @@ class Daemon:
         """Constructs the daemon."""
         logger.debug("Creating daemon")
         self.injectors = {}
+
         self.config_dir = None
+
+        if USER != "root":
+            self.set_config_dir(get_config_path())
+
+        # check privileges
+        if os.getuid() != 0:
+            logger.warning("The service usually needs elevated privileges")
 
         self.autoload_history = AutoloadHistory()
         self.refreshed_devices_at = 0
 
         atexit.register(self.stop_all)
+
+        # initialize stuff that is needed alongside the daemon process
+        macro_variables.start()
 
     @classmethod
     def connect(cls, fallback=True):
@@ -165,7 +194,7 @@ class Daemon:
         """
         try:
             bus = SystemBus()
-            interface = bus.get(BUS_NAME)
+            interface = bus.get(BUS_NAME, timeout=BUS_TIMEOUT)
             logger.info("Connected to the service")
         except GLib.GError as error:
             if not fallback:
@@ -190,7 +219,7 @@ class Daemon:
             # try a few times if the service was just started
             for attempt in range(3):
                 try:
-                    interface = bus.get(BUS_NAME)
+                    interface = bus.get(BUS_NAME, timeout=BUS_TIMEOUT)
                     break
                 except GLib.GError as error:
                     logger.debug(
@@ -202,6 +231,11 @@ class Daemon:
             else:
                 logger.error("Failed to connect to the service")
                 sys.exit(1)
+
+        if USER != "root":
+            config_path = get_config_path()
+            logger.debug('Telling service about "%s"', config_path)
+            interface.set_config_dir(get_config_path(), timeout=2)
 
         return interface
 
@@ -231,12 +265,16 @@ class Daemon:
         now = time.time()
         if now - 10 > self.refreshed_devices_at:
             logger.debug("Refreshing because last info is too old")
+            # it may take a little bit of time until devices are visible after
+            # changes
+            time.sleep(0.1)
             groups.refresh()
             self.refreshed_devices_at = now
             return
 
         if not groups.find(key=group_key):
             logger.debug('Refreshing because "%s" is unknown', group_key)
+            time.sleep(0.1)
             groups.refresh()
             self.refreshed_devices_at = now
 
@@ -256,6 +294,7 @@ class Daemon:
         injector = self.injectors.get(group_key)
         return injector.get_state() if injector else UNKNOWN
 
+    @remove_timeout
     def set_config_dir(self, config_dir):
         """All future operations will use this config dir.
 
@@ -317,6 +356,7 @@ class Daemon:
         self.start_injecting(group.key, preset)
         self.autoload_history.remember(group.key, preset)
 
+    @remove_timeout
     def autoload_single(self, group_key):
         """Inject the configured autoload preset for the device.
 
@@ -334,16 +374,16 @@ class Daemon:
         logger.info('Request to autoload for "%s"', group_key)
 
         if self.config_dir is None:
-            # spams on boot, when no user is logged in yet
-            logger.debug(
-                'Tried to autoload "%s" without configuring the daemon '
-                "first via set_config_dir.",
+            logger.error(
+                'Request to autoload "%s" before a user told the service about their '
+                "session using set_config_dir",
                 group_key,
             )
             return
 
         self._autoload(group_key)
 
+    @remove_timeout
     def autoload(self):
         """Load all autoloaded presets for the current config_dir.
 
@@ -351,8 +391,8 @@ class Daemon:
         """
         if self.config_dir is None:
             logger.error(
-                "Tried to autoload without configuring the daemon first "
-                "via set_config_dir."
+                "Request to autoload all before a user told the service about their "
+                "session using set_config_dir",
             )
             return
 
@@ -384,8 +424,8 @@ class Daemon:
 
         if self.config_dir is None:
             logger.error(
-                "Tried to start an injection without configuring the daemon "
-                "first via set_config_dir."
+                "Request to start an injectoin before a user told the service about "
+                "their session using set_config_dir",
             )
             return False
 
